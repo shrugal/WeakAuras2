@@ -11,12 +11,22 @@ local L = WeakAuras.L
 local LibSerialize = LibStub("LibSerialize")
 local LibDeflate = LibStub:GetLibrary("LibDeflate")
 
+local canaccessvalue = canaccessvalue or function () return true end
+-- Midnight denies aura reads to tainted code while auras are secret: C_UnitAuras raises
+-- "Auras cannot be accessed when secret while tainted by 'WeakAuras'" instead of returning
+-- data, so ask first and hand custom code nil when it can't be read, see BuffTrigger2.lua
+local ShouldAurasBeSecret = C_Secrets and C_Secrets.ShouldAurasBeSecret or function() return false end
+
 local UnitAura = UnitAura
 if UnitAura == nil then
   --- Deprecated in 10.2.5
   UnitAura = function(unitToken, index, filter)
-		local auraData = C_UnitAuras.GetAuraDataByIndex(unitToken, index, filter)
-		if not auraData then
+		if ShouldAurasBeSecret() then
+			return nil;
+		end
+
+		local ok, auraData = pcall(C_UnitAuras.GetAuraDataByIndex, unitToken, index, filter)
+		if not ok or not canaccessvalue(auraData) or not auraData then
 			return nil;
 		end
 

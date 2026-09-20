@@ -90,6 +90,45 @@ local getaccessiblevalue = function (a, b) if canaccessvalue(a) then return a el
 
 local newAPI = WeakAuras.IsRetail()
 
+-- Midnight guards the aura APIs with RequiresUnitAuraAccess, and its failure mode is an
+-- error: while auras are secret, tainted code -- that's us -- may not read them at all, so
+-- C_UnitAuras.GetAuraDataByIndex and the GetAuraSlots enumeration behind AuraUtil.ForEachAura
+-- both raise "Auras cannot be accessed when secret while tainted by 'WeakAuras'" instead of
+-- returning data. C_Secrets.ShouldAurasBeSecret answers that up front; the pcall covers
+-- builds that predate it and units that are restricted on their own. A scan then simply
+-- finds no auras, which is all we can honestly report while access is denied.
+local ShouldAurasBeSecret = C_Secrets and C_Secrets.ShouldAurasBeSecret or function() return false end
+
+local function GetAuraDataByInstanceID(unit, auraInstanceID)
+  if ShouldAurasBeSecret() then
+    return nil
+  end
+  local ok, aura = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unit, auraInstanceID)
+  if ok then
+    return getaccessiblevalue(aura)
+  end
+end
+
+-- The 255 bound matches WA_GetUnitAura in AuraEnvironment.lua.
+local function ForEachAuraByIndex(unit, filter, func)
+  if ShouldAurasBeSecret() then
+    return
+  end
+  for index = 1, 255 do
+    local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, unit, index, filter)
+    if not ok then
+      -- this unit is restricted after all, nothing on it is readable
+      return
+    end
+    if canaccessvalue(aura) then
+      -- only nil ends the list, a secret aura is one we skip and keep going
+      if not aura or func(aura) then
+        return
+      end
+    end
+  end
+end
+
 ---@class WeakAuras
 local WeakAuras = WeakAuras
 local L = WeakAuras.L
@@ -787,23 +826,23 @@ local function UpdateStateWithMatch(time, bestMatch, triggerStates, cloneId, mat
     end
 
     local GUID = bestMatch.unit and UnitGUID(bestMatch.unit) or bestMatch.GUID
-    if state.GUID ~= GUID then
+    if canaccessvalue(state.GUID) and state.GUID ~= GUID then
       state.GUID = GUID
       changed = true
     end
 
-    if state.role ~= role then
+    if canaccessvalue(state.role) and state.role ~= role then
       state.role = role
       state.roleIcon = roleIcons[role]
       changed = true
     end
 
-    if state.raidMark ~= raidMark then
+    if canaccessvalue(state.raidMark) and state.raidMark ~= raidMark then
       state.raidMark = raidMark
       changed = true
     end
 
-    if state.unitName ~= bestMatch.unitName then
+    if canaccessvalue(state.unitName) and state.unitName ~= bestMatch.unitName then
       state.unitName = bestMatch.unitName
       changed = true
     end
@@ -1787,7 +1826,7 @@ do
         _time = GetTime()
         _unit = unit
         _filter = filter
-        AuraUtil.ForEachAura(unit, filter, nil, HandleAura, true)
+        ForEachAuraByIndex(unit, filter, HandleAura)
       else
         local time = GetTime()
         local index = 1
@@ -1928,11 +1967,16 @@ do
       if newAPI then
         -- copy parameters passed to ScanUnitWithFilter in parent's scope for HandleAura
         _matchDataChanged, _time, _unit, _filter, _scanFuncNameGroup, _scanFuncSpellIdGroup, _scanFuncGeneralGroup, _scanFuncName, _scanFuncSpellId, _scanFuncGeneral = matchDataChanged, time, unit, filter, scanFuncNameGroup, scanFuncSpellIdGroup, scanFuncGeneralGroup, scanFuncName, scanFuncSpellId, scanFuncGeneral
-        if unitAuraUpdateInfo then
+        -- if any part of the update info is a secret value we can't read, fall back to a full scan
+        local incremental = unitAuraUpdateInfo ~= nil
+                            and canaccessvalue(unitAuraUpdateInfo.addedAuras)
+                            and canaccessvalue(unitAuraUpdateInfo.updatedAuraInstanceIDs)
+                            and canaccessvalue(unitAuraUpdateInfo.removedAuraInstanceIDs)
+        if incremental then
           -- incremental
           if unitAuraUpdateInfo.addedAuras ~= nil then
             for _, aura in ipairs(unitAuraUpdateInfo.addedAuras) do
-              if (getaccessiblevalue(aura.isHelpful) and filter == "HELPFUL" or getaccessiblevalue(aura.isHarmful) and filter == "HARMFUL") then
+              if canaccessvalue(aura) and (getaccessiblevalue(aura.isHelpful) and filter == "HELPFUL" or getaccessiblevalue(aura.isHarmful) and filter == "HARMFUL") then
                 HandleAura(aura)
               end
             end
@@ -1940,7 +1984,7 @@ do
 
           if unitAuraUpdateInfo.updatedAuraInstanceIDs ~= nil then
             for _, auraInstanceID in ipairs(unitAuraUpdateInfo.updatedAuraInstanceIDs) do
-              local aura = C_UnitAuras.GetAuraDataByAuraInstanceID(unit, auraInstanceID)
+              local aura = GetAuraDataByInstanceID(unit, auraInstanceID)
               if aura and (getaccessiblevalue(aura.isHelpful) and filter == "HELPFUL" or getaccessiblevalue(aura.isHarmful) and filter == "HARMFUL") then
                 HandleAura(aura)
               end
@@ -1971,7 +2015,7 @@ do
           -- full
           -- clean first
           CleanUpOutdatedMatchData(nil, unit, filter)
-          AuraUtil.ForEachAura(unit, filter, nil, HandleAura, true)
+          ForEachAuraByIndex(unit, filter, HandleAura)
         end
       else
         local index = 1
@@ -2308,7 +2352,8 @@ local function EventHandler(frame, event, arg1, arg2, ...)
     if newAPI then
       -- arg1: unit
       -- arg2: unitAuraUpdateInfo
-      if arg2 == nil or arg2.isFullUpdate then
+      -- if isFullUpdate is a secret value we can't read, do a full scan
+      if arg2 == nil or getaccessiblevalue(arg2.isFullUpdate, true) then
         ScanUnit(time, arg1)
       else
         ScanUnit(time, arg1, arg2)
@@ -2337,6 +2382,15 @@ local function EventHandler(frame, event, arg1, arg2, ...)
       end
     end
 
+  elseif event == "ADDON_RESTRICTION_STATE_CHANGED" then
+    -- aura access comes and goes with the restriction state, so everything scanned
+    -- while auras were secret is stale now, in both directions
+    for unit in pairs(matchData) do
+      ScanUnit(time, unit)
+      if not UnitExistsFixed(unit) then
+        tinsert(unitsToRemove, unit)
+      end
+    end
   elseif event == "RAID_TARGET_UPDATE" then
     ScanRaidMarkScanFunc(matchDataChanged)
   elseif event == "UNIT_TARGETABLE_CHANGED" then
@@ -2405,6 +2459,9 @@ Buff2Frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 Buff2Frame:RegisterEvent("PARTY_MEMBER_DISABLE")
 Buff2Frame:RegisterEvent("PARTY_MEMBER_ENABLE")
 Buff2Frame:RegisterEvent("UNIT_TARGETABLE_CHANGED")
+if WeakAuras.IsRetail() then
+  Buff2Frame:RegisterEvent("ADDON_RESTRICTION_STATE_CHANGED")
+end
 Buff2Frame:SetScript("OnEvent", EventHandler)
 
 -- For UNIT_IN_RANGE_UPDATE Blizzard apparently checks whether anyone
@@ -4119,7 +4176,7 @@ do
   AugmentMatchDataMulti = function(matchData, unit, filter, sourceGUID, nameKey, spellKey)
     if newAPI then
       _matchData, _unit, _sourceGUID, _nameKey, _spellKey = matchData, unit, sourceGUID, nameKey, spellKey
-      AuraUtil.ForEachAura(unit, filter, nil, HandleAura, true)
+      ForEachAuraByIndex(unit, filter, HandleAura)
     else
       local index = 1
       while true do
@@ -4245,7 +4302,7 @@ do
     if newAPI then
       _base = base
       _unit = unit
-      AuraUtil.ForEachAura(unit, filter, nil, HandleAura, true)
+      ForEachAuraByIndex(unit, filter, HandleAura)
     else
       local index = 1
       while true do
