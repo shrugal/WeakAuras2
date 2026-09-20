@@ -12,3 +12,4 @@ format.bat
 .lua/*
 .vscode
 CHANGELOG.MD
+*.local.md
