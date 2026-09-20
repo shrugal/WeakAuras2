@@ -371,6 +371,7 @@ function ConstructFunction(prototype, trigger)
   local init;
   local preambles = [=[
     local canaccessvalue = canaccessvalue or function () return true end
+    local canaccessallvalues = canaccessallvalues or function () return true end
     local getaccessiblevalue = function (a, b) if canaccessvalue(a) then return a else return b end end
   ]=]
   local orConjunctionGroups = {}
@@ -1692,6 +1693,11 @@ function GenericTrigger.Add(data, region)
 
             prototype = event_prototypes[trigger.event]
             triggerFuncStr = ConstructFunction(prototype, trigger);
+
+            -- TODO:DEBUG
+            -- if id == "Insanity" and triggernum == 1 and DevTool then
+            --   DevTool:AddData({ string.split("\n", triggerFuncStr) }, "Insanity Trigger")
+            -- end
 
             statesParameter = prototype.statesParameter;
             triggerFunc = Private.LoadFunction(triggerFuncStr, id);
